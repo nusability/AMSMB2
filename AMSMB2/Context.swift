@@ -360,7 +360,48 @@ extension SMB2Client {
         }
     }
 
-    private func wait_for_reply(_ cb: inout CBData) throws {
+
+    /// A `CBData` slot that libsmb2 can safely hold a pointer to.
+    ///
+    /// **Why this exists.** `generic_handler` receives an opaque pointer and
+    /// reads a `CBData` *reference* out of the memory it names. Passing
+    /// `withUnsafeMutablePointer(to: &cb)` names a **stack slot**, so if the
+    /// enclosing frame unwinds while libsmb2 still has the request registered,
+    /// that pointer refers to dead stack — and the reference read out of it is
+    /// garbage, which the runtime then retains. Three paths unwind with a
+    /// request outstanding: the immediate `throwIfError`, a `poll()` failure,
+    /// and the operation timeout.
+    ///
+    /// Observed as a reproducible `SIGSEGV` in `libswiftCore` beneath
+    /// `SMB2FileHandle.deinit` → `service(revents:)` → `read_cb`, on a stalled
+    /// SMB stream that was being seeked (Vidi reports DFFV and MAKM, identical
+    /// stacks).
+    ///
+    /// The slot is heap-allocated and freed **only once the callback has
+    /// actually fired**. If the frame unwinds first the slot is deliberately
+    /// leaked: a few dozen bytes per abandoned request, against a crash. A leak
+    /// that is bounded by the number of failed operations is the better trade,
+    /// and it keeps the pointer libsmb2 holds valid for as long as libsmb2
+    /// might use it.
+    private final class CBSlot {
+        let pointer: UnsafeMutablePointer<CBData>
+
+        init(_ data: CBData) {
+            pointer = .allocate(capacity: 1)
+            pointer.initialize(to: data)
+        }
+
+        var data: CBData { pointer.pointee }
+
+        /// Free the slot, but only when libsmb2 can no longer reach it.
+        func releaseIfFinished() {
+            guard pointer.pointee.isFinished else { return } // else: leak, on purpose
+            pointer.deinitialize(count: 1)
+            pointer.deallocate()
+        }
+    }
+
+    private func wait_for_reply(_ cb: CBData) throws {
         let startDate = Date()
         while !cb.isFinished {
             var pfd = pollfd()
@@ -413,7 +454,7 @@ extension SMB2Client {
         throws -> (result: Int32, data: DataType)
     {
         try withThreadSafeContext { context -> (Int32, DataType) in
-            var cb = CBData()
+            let cb = CBData()
             var resultData: DataType?
             var dataHandlerError: (any Error)?
             cb.dataHandler = { ptr in
@@ -423,11 +464,11 @@ extension SMB2Client {
                     dataHandlerError = error
                 }
             }
-            let result = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb)
-            }
+            let slot = CBSlot(cb)
+            defer { slot.releaseIfFinished() }
+            let result = try handler(context, UnsafeMutableRawPointer(slot.pointer))
             try POSIXError.throwIfError(result, description: error)
-            try wait_for_reply(&cb)
+            try wait_for_reply(cb)
             let cbResult = cb.result
 
             try POSIXError.throwIfError(cbResult, description: error)
@@ -451,7 +492,7 @@ extension SMB2Client {
         throws -> (status: UInt32, data: DataType)
     {
         try withThreadSafeContext { context -> (UInt32, DataType) in
-            var cb = CBData()
+            let cb = CBData()
             var resultData: DataType?
             var dataHandlerError: (any Error)?
             cb.dataHandler = { ptr in
@@ -461,11 +502,11 @@ extension SMB2Client {
                     dataHandlerError = error
                 }
             }
-            let pdu = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb).unwrap()
-            }
+            let slot = CBSlot(cb)
+            defer { slot.releaseIfFinished() }
+            let pdu = try handler(context, UnsafeMutableRawPointer(slot.pointer)).unwrap()
             smb2_queue_pdu(context, pdu)
-            try wait_for_reply(&cb)
+            try wait_for_reply(cb)
 
             try POSIXError.throwIfErrorStatus(cb.status)
             if let error = dataHandlerError { throw error }
