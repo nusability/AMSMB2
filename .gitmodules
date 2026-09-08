@@ -1,3 +1,4 @@
 [submodule "Dependencies/libsmb2"]
 	path = Dependencies/libsmb2
-	url = https://github.com/sahlberg/libsmb2
+	url = https://github.com/nusability/libsmb2
+	branch = vidi-fstat-null-deref
