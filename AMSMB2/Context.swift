@@ -210,9 +210,28 @@ extension SMB2Client {
     func service(revents: Int32) throws {
         let result = smb2_service(context, revents)
         if result < 0 {
+            // Read the cause BEFORE the context is freed. `error` and `ntError`
+            // are computed over `context`, so evaluating them after `context =
+            // nil` returns nothing: the server's status and libsmb2's message
+            // are both gone, and `smb2_service` only ever returns a bare -1, so
+            // every failure here degraded to EPERM with an empty description.
+            // libsmb2 closes the context before calling back on most errors, so
+            // that was nearly every SMB failure reported to a caller.
+            let description = error
+            let status = ntError
             smb2_destroy_context(context)
             context = nil
-            try POSIXError.throwIfError(result, description: error)
+            if status.severity == .error {
+                // The status is the dependable half: a number the server sent,
+                // not prose that can be localized or reworded. Keep libsmb2's
+                // sentence after it when there is one.
+                throw POSIXError(
+                    status.posixErrorCode,
+                    description: "Error 0x\(String(status.rawValue, radix: 16, uppercase: true)): "
+                        + (description ?? status.localizedDescription)
+                )
+            }
+            try POSIXError.throwIfError(result, description: description)
         }
     }
 }
